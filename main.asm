@@ -119,9 +119,9 @@ extern GetTickCount              : proc ; Retrieves the number of milliseconds t
 
 
 
-;target_process	db "Notepad.exe", 0            ; The executable name of the process to inject into. CAP SENSITIVE PROCESS
-target_process	db "ProcessToTarget.exe", 0
-library_name	db "C:\\DllToInject.dll", 0    ; --- IMPORTANT: Full path to the DLL that will be injected. ---
+;target_process	db "Notepad.exe", 0               ; The executable name of the process to inject into. CAP SENSITIVE PROCESS
+target_process	db "Exodus-Win64-Shipping.exe", 0 ; "TenMilesToSafety-Win64-Shipping.exe", 0
+library_name	db "C:\\DllToInject.dll", 0       ; --- IMPORTANT: Full path to the DLL that will be injected. ---
 
 ; Calculate the length of the library_name string *excluding* the null terminator.
 ; '$' represents the current address, so '$ - library_name' gives the length.
@@ -159,9 +159,6 @@ library_len		equ $ - library_name
 .code
 
 
-
-
-
 ; Definition for IMAGE_NT_HEADERS64
 IMAGE_NT_HEADERS64 STRUCT
     Signature       DWORD ?                 ; Should be IMAGE_NT_SIGNATURE ('PE\0\0')
@@ -181,14 +178,36 @@ IMAGE_IMPORT_DESCRIPTOR STRUCT
 IMAGE_IMPORT_DESCRIPTOR ENDS
 
 
-
-
-
-
-
-
+;Start of Image_function
 StartInjected:
 Injected PROC
+    ;int 3 ;Breakpoint if needed
+
+    jmp start_code        ; Jump over the strings
+
+    ; Embedded strings section
+    ; The processor will never execute these as they're jumped over
+    GetProcAddrStr db 'GetProcAddress', 0
+    GetModuleHandleStr db 'GetModuleHandleA', 0
+    GetTickCountStr db 'GetTickCount', 0
+    QueryPerformanceCounterStr db 'QueryPerformanceCounter', 0
+    LoadLibraryStr db 'LoadLibraryA', 0
+    WinmmStr db 'winmm.dll', 0
+    TimeGetTimeStr db 'timeGetTime', 0
+    VirtualProtectStr db 'VirtualProtect', 0
+    ; Add padding to ensure proper alignment if needed
+    ;align 8
+
+    pdGetTickCount dq 0
+    pdQueryPerformanceCounter dq 0
+    pdtimeGetTime dq 0
+    pBasePerformanceCount dq 0, 0
+    pAcceleration     dq 5
+    pBaseGetTime dq 0
+    pBaseTickCount dq 0
+    start_code:
+
+
     ; ... (prologue remains the same) ...
     push rbx
     push rsi
@@ -212,68 +231,151 @@ Injected PROC
     mov rsi, [rsi]                    ; -> kernel32 entry
     mov rbx, [rsi+10h]                ; RBX = Kernel32 Base Address
 
+; --- Find GetProcAddress within kernel32.dll export table ---
+; 1. Find the export directory
+mov eax, [rbx+3Ch]    ; Get PE header offset
+lea r13, [rbx+rax]    ; R13 = PE header address
+    
+; Get export directory VA - different offset for 64-bit PE
+mov eax, [r13+88h]    ; RAX = export directory RVA
+lea r14, [rbx+rax]    ; R14 = export directory VA
+    
+; Get number of functions
+mov ecx, [r14+18h]    ; ECX = number of functions (NumberOfNames)
+    
+; Get address arrays
+mov eax, [r14+1Ch]    ; EAX = AddressOfFunctions RVA
+lea r8, [rbx+rax]     ; R8 = AddressOfFunctions VA
+    
+mov eax, [r14+20h]    ; EAX = AddressOfNames RVA
+lea r9, [rbx+rax]     ; R9 = AddressOfNames VA
+    
+mov eax, [r14+24h]    ; EAX = AddressOfNameOrdinals RVA
+lea r10, [rbx+rax]    ; R10 = AddressOfNameOrdinals VA
+    
+; Now start loop to find GetProcAddress
+xor rsi, rsi          ; RSI = index counter
+    
+find_getprocaddr_loop:
+    ; Check if we've checked all functions
+    cmp rsi, rcx
+    jae SkipHooks     ; If we've checked all functions and not found it
+    
+    ; Get the name RVA for this function
+    mov eax, [r9+rsi*4]   ; EAX = RVA of current function name
+    lea rdi, [rbx+rax]    ; RDI = VA of current function name
+    
+    ; Pointer to our string to compare
+    lea r11, [GetProcAddrStr]
+    
+    ; Compare strings
+compare_str:
+    movzx eax, byte ptr [rdi]   ; Get byte from function name
+    movzx edx, byte ptr [r11]   ; Get byte from our string
+    test eax, eax
+    jz check_end
+    cmp eax, edx
+    jne next_function
+    inc rdi
+    inc r11
+    jmp compare_str
+    
+check_end:
+    test edx, edx           ; If our string also ended, we have a match
+    jnz next_function     ; If not, strings don't match
+    
+    ; Found GetProcAddress, get its ordinal
+    movzx eax, word ptr [r10+rsi*2]  ; EAX = ordinal (zero extended to 32-bit)
+    
+    ; Use the ordinal to get the function address
+    mov eax, [r8+rax*4]   ; EAX = RVA of function
+    lea r15, [rbx+rax]    ; R15 = VA of GetProcAddress
+    jmp continue_with_getprocaddr
+    
+next_function:
+    inc rsi
+    jmp find_getprocaddr_loop
+    
+continue_with_getprocaddr:
+
+
 
     ; --- Get EXE Base Address using GetModuleHandleA(NULL) ---
     ; 1. Get address of GetModuleHandleA itself
-    lea rdx, szGetModuleHandleA       ; RDX = "GetModuleHandleA"
-    mov rcx, rbx                      ; RCX = Kernel32 Base Address
-    call r15                          ; Call GetProcAddress(hKernel32, "GetModuleHandleA")
-    test rax, rax                     ; Check if GetProcAddress succeeded
-    jz SkipHooks                      ; Or some other error handling if GetModuleHandleA not found
+    ; r15 is expected to have <kernel32.GetProcAddress>
+    lea rdx, [GetModuleHandleStr]           ; szGetModuleHandleA       ; RDX = "GetModuleHandleA"
+    mov rcx, rbx                            ; RCX = Kernel32 Base Address
+    call r15                                ; Call GetProcAddress(hKernel32, "GetModuleHandleA")
+    test rax, rax                           ; Check if GetProcAddress succeeded
+    jz SkipHooks                            ; Or some other error handling if GetModuleHandleA not found
 
     ; RAX now holds the address of GetModuleHandleA
     ; 2. Call GetModuleHandleA(NULL) to get EXE base
-    xor rcx, rcx                      ; RCX = NULL (Argument for GetModuleHandleA)
-    call rax                          ; Call GetModuleHandleA(NULL)
-    test rax, rax                     ; Check if GetModuleHandleA(NULL) succeeded
-    jz SkipHooks                      ; Or some other error handling if base address is NULL
+    xor rcx, rcx                            ; RCX = NULL (Argument for GetModuleHandleA)
+    call rax                                ; Call GetModuleHandleA(NULL)
+    ;RAX now holds the injected modules main address
+    test rax, rax                           ; Check if GetModuleHandleA(NULL) succeeded
+    jz SkipHooks                            ; Or some other error handling if base address is NULL
 
     ; RAX now holds the EXE Base Address
-    mov r12, rax                      ; R12 = EXE Base Address
-
+    mov r12, rax                            ; R12 = EXE Base Address
 
     ; ... (GetProcAddress for GetTickCount, QPC, LoadLibraryA as before, using RBX for kernel32 base) ...
-    lea rdx, szGetTickCount
-    mov rcx, rbx                      ; KERNEL32 base
-    call r15                          ; Call GetProcAddress
-    mov [dGetTickCount], rax
+    lea rdx, [GetTickCountStr]              ; szGetTickCount
+    mov rcx, rbx                            ; KERNEL32 base
+    call r15                                ; Call GetProcAddress
+    mov [pdGetTickCount], rax
 
-    lea rdx, szQueryPerformanceCounter
-    mov rcx, rbx                      ; KERNEL32 base
-    call r15                          ; Call GetProcAddress
-    mov [dQueryPerformanceCounter], rax
+    lea rdx, [QueryPerformanceCounterStr]   ; szQueryPerformanceCounter
+    mov rcx, rbx                            ; KERNEL32 base
+    call r15                                ; Call GetProcAddress
+    mov [pdQueryPerformanceCounter], rax
 
-    lea rdx, load_library
-    mov rcx, rbx ; kernel32 base
-    call r15 ; GetProcAddress for LoadLibraryA
+    lea rdx, [LoadLibraryStr]               ; load_library
+    mov rcx, rbx                            ; kernel32 base
+    call r15                                ; GetProcAddress for LoadLibraryA
+    
     ; Now RAX has LoadLibraryA address
-    lea rcx, szWinmm
-    call rax                          ; Call LoadLibraryA(szWinmm)
-    mov r14, rax                      ; R14 = winmm.dll handle (check for NULL)
+    lea rcx, [WinmmStr]                     ; szWinmm
+    call rax                                ; Call LoadLibraryA(szWinmm)
+    mov r14, rax                            ; R14 = winmm.dll handle (check for NULL)
     test r14, r14
     jz SkipWinmmHooking
 
     ; Get timeGetTime function from winmm.dll
-    lea rdx, sztimeGetTime
-    mov rcx, r14                      ; winmm.dll handle
-    call r15                          ; Call GetProcAddress
-    mov [dtimeGetTime], rax
+    lea rdx, [TimeGetTimeStr]               ; sztimeGetTime
+    mov rcx, r14                            ; winmm.dll handle
+    call r15                                ; Call GetProcAddress
+    mov [pdtimeGetTime], rax
     test rax, rax
     jz SkipWinmmHooking
 
-    ; ... (Initialize base time values as before) ...
+    ;Get VirtualProtect for HookFunction
+    lea rdx, [VirtualProtectStr]            ; VirtualProtect
+    mov rcx, rbx                            ; kernel32 base
+    call r15
+    mov r13, rax
 
+    ; ... (Initialize base time values as before) ...
+    ; r13d = VirtualProtectAddr for hook function
+    ; r14 = winmm.dll addr <-- 12,13,14 get overwritten by hook function
+    ; rax = timeGetTime addr
+    ; [dtimeGetTime]
+    ; [pdGetTickCount]
+    ; [pdQueryPerformanceCounter]
+    ; [pdGetTickCount]
+    
 SkipWinmmHooking:
-    mov rax, [dQueryPerformanceCounter]
+    mov rax, [pdQueryPerformanceCounter]
     test rax, rax
     jz SkipHooks
-    lea rcx, BasePerformanceCount
-    call rax
+    lea rcx, pBasePerformanceCount
+    call rax                                ; init QueryPerformanceCounter
 
     ; === Set up hooks using SetHook function ===
 
     ; Hook GetTickCount (Targeting EXE's IAT)
-    mov rax, [dGetTickCount]
+    mov rax, [pdGetTickCount]
     test rax, rax
     jz SkipHook1
     mov r8, rax               ; R8 = Original Address (GetTickCount)
@@ -286,7 +388,7 @@ SkipHook1:
     ; This assumes you want to hook calls *originating* from winmm.dll or
     ; modules importing directly from it *after* it's loaded here.
     ; If you want to hook the EXE's calls to timeGetTime, use R12 for RCX here too.
-    mov rax, [dtimeGetTime]
+    mov rax, [pdtimeGetTime]
     test rax, rax
     jz SkipHook2
     mov r8, rax               ; R8 = Original Address (timeGetTime)
@@ -296,7 +398,7 @@ SkipHook1:
 SkipHook2:
 
     ; Hook QueryPerformanceCounter (Targeting EXE's IAT)
-    mov rax, [dQueryPerformanceCounter]
+    mov rax, [pdQueryPerformanceCounter]
     test rax, rax
     jz SkipHook3
     mov r8, rax               ; R8 = Original Address (QueryPerformanceCounter)
@@ -326,6 +428,15 @@ Injected ENDP
 ; =====================================================================
 SetHook proc 
 
+
+    jmp start_hook_code        ; Jump over the strings
+
+    pdVirtualProtect dq 0
+    align 8
+    start_hook_code:
+
+
+
     ; --- Manual Prologue ---
     ; Save non-volatile registers used by the function
     push rsi
@@ -344,6 +455,8 @@ SetHook proc
     ; Smallest multiple >= 40 bytes is 48 bytes (30h).
     sub rsp, 30h
     ; Stack layout: [rsp+20h] = dwOldProtect, [rsp+0]..[rsp+1Fh] = shadow space
+
+    mov [pdVirtualProtect], r13 ; Save register
 
     ; --- Function Body ---
     ; Move input parameters to non-volatile registers for safekeeping
@@ -405,7 +518,7 @@ ThunkLoop:
     ; Get address for dwOldProtect on stack (rsp + shadow space size)
     lea r9, [rsp + 20h]           ; arg 4: lpflOldProtect = Address on stack
 
-    call VirtualProtect           ; Call the API function
+    call [pdVirtualProtect] ;VirtualProtect           ; Call the API function
 
     ; Check if VirtualProtect succeeded
     test rax, rax
@@ -453,12 +566,13 @@ SetHook endp
 ; GetTickCountHook - Replacement for GetTickCount that accelerates time
 ; =====================================================================
 GetTickCountHook PROC
+    ;int 3
     sub rsp, 40                     ; Shadow space + alignment
     
-    call qword ptr [dGetTickCount]  ; Call original GetTickCount, this cannot work with Inline Injection
+    call qword ptr [pdGetTickCount]  ; Call original GetTickCount, this cannot work with Inline Injection
     mov rdx, rax                    ; RDX = currentTickCount
-    sub rdx, qword ptr [BaseTickCount] ; RDX = currentTickCount - BaseTickCount
-    imul rdx, qword ptr [Acceleration] ; RDX = (currentTickCount - BaseTickCount) * Acceleration
+    sub rdx, qword ptr [pBaseTickCount] ; RDX = currentTickCount - BaseTickCount
+    imul rdx, qword ptr [pAcceleration] ; RDX = (currentTickCount - BaseTickCount) * Acceleration
     add rax, rdx                    ; RAX = BaseTickCount + ((currentTickCount - BaseTickCount) * Acceleration)
     
     add rsp, 40                     ; Restore stack
@@ -469,12 +583,13 @@ GetTickCountHook ENDP
 ; timeGetTimeHook - Replacement for timeGetTime that accelerates time
 ; =====================================================================
 timeGetTimeHook PROC
+    ;int 3
     sub rsp, 40                        ; Shadow space + alignment
     
-    call qword ptr [dtimeGetTime]      ; Call original timeGetTime
+    call qword ptr [pdtimeGetTime]      ; Call original timeGetTime
     mov rdx, rax                       ; RDX = currentGetTime
-    sub rdx, qword ptr [BaseGetTime]   ; RDX = currentGetTime - BaseGetTime
-    imul rdx, qword ptr [Acceleration] ; RDX = (currentGetTime - BaseGetTime) * Acceleration
+    sub rdx, qword ptr [pBaseGetTime]   ; RDX = currentGetTime - BaseGetTime
+    imul rdx, qword ptr [pAcceleration] ; RDX = (currentGetTime - BaseGetTime) * Acceleration
     add rax, rdx                       ; RAX = BaseGetTime + ((currentGetTime - BaseGetTime) * Acceleration)
     
     add rsp, 40                        ; Restore stack
@@ -482,6 +597,7 @@ timeGetTimeHook PROC
 timeGetTimeHook ENDP
 
 QueryPerformanceCounterHook PROC
+    ; int 3
     ; RCX = lpPerformanceCount (original caller's pointer)
 
     ; --- Prologue ---
@@ -495,15 +611,15 @@ QueryPerformanceCounterHook PROC
 
     ; --- Call Original Function ---
     lea rcx, [rsp+20h] ; RCX = Address of the local variable (Correct argument register)
-    call qword ptr [dQueryPerformanceCounter]
+    call qword ptr [pdQueryPerformanceCounter]
     test rax, rax      ; Check if original call succeeded
     jz QueryFailed_RestoreStack ; Jump to failure path
 
     ; --- Process Result (Original Call Succeeded) ---
     mov rax, qword ptr [rsp+20h] ; Load the counter value from the local variable
-    sub rax, qword ptr [BasePerformanceCount] ; Calculate delta
-    imul rax, qword ptr [Acceleration]        ; Apply acceleration
-    add rax, qword ptr [BasePerformanceCount] ; Add base back
+    sub rax, qword ptr [pBasePerformanceCount] ; Calculate delta
+    imul rax, qword ptr [pAcceleration]        ; Apply acceleration
+    add rax, qword ptr [pBasePerformanceCount] ; Add base back
 
     ; --- Store Final Result ---
     mov rdx, [rsp+28h] ; Restore the original caller's pointer from the stack into RDX
@@ -526,7 +642,7 @@ QueryEnd_RestoreStack:
 QueryPerformanceCounterHook ENDP
 
 EndInjected:
-
+;End of Inject_function
 
 
 
@@ -1011,7 +1127,7 @@ inject_function proc
       mov r8d, eax            ; zero-extend into r8 ; R8  = dwSize = Size of function section to write
 
 	mov		r9 , 3000h					; R9  = flAllocationType = MEM_COMMIT | MEM_RESERVE (0x1000 | 0x2000).
-	mov qword ptr [rsp + 20h], 4 ; StackArg1 = flProtect = PAGE_READWRITE (0x4).	; 5th argument goes on the stack (at RSP+20h in the caller's frame).
+	mov qword ptr [rsp + 20h], 40h ;StackArg1 = flProtect = PAGE_EXECUTE_READWRITE (0x40). ; 5th argument on the stack.
 	call	VirtualAllocEx				      ; Returns pointer to allocated memory in RAX, or NULL on failure.
 
 	mov		r13, rax					; Store the allocated memory pointer in R13.
@@ -1030,25 +1146,25 @@ inject_function proc
 	cmp		rax, 0					; Check if WriteProcessMemory returned 0.
 	je		exit_cleanup				; If failed, jump to cleanup.
 
-      ; Get the address of LoadLibraryA. This address is the same in the target process
+      ; Get the address of GetProcAccess This address is the same in the target process
 	; because kernel32.dll is loaded at the same base address in all processes (usually).
 	call	get_proc_address			            ; Returns address in RAX.
-
 	cmp		rax, 0					; Check if get_load_library failed (returned NULL).
 	je		exit_cleanup				; If failed, jump to cleanup.
+      mov         r15d, eax
 
 
 	
 	; Create a new thread in the target process. This thread will start execution
 	; at the address of LoadLibraryA, and will be passed the address of the DLL
 	; path (which we wrote into the target process) as its parameter.
-	; Effectively calls: Injected(address_of_GetProcessAddr)
+	; Effectively calls: Injected function
 	mov		rcx, r12					; Arg1: hProcess (target process handle).
 	xor		rdx, rdx					; Arg2: lpThreadAttributes (NULL = default).
 	xor		r8 , r8					; Arg3: dwStackSize (0 = default).
-	mov		r9 , rax					; Arg4: lpStartAddress (address of WriteProcessMemory).
+	mov		r9 , r13					; Arg4: lpStartAddress (address of WriteProcessMemory).
 	                                                ; Arguments 5, 6, 7 are passed on the stack.
-	mov qword ptr [rsp + 20h], r13                  ; Arg5: lpParameter (address of the allocated DLL path string).
+	mov qword ptr [rsp + 20h], r15                  ; Arg5: lpParameter (address of the allocated DLL path string).
 	mov qword ptr [rsp + 28h], 0                    ; Arg6: dwCreationFlags (0 = run immediately).
 	mov qword ptr [rsp + 30h], 0                    ; Arg7: lpThreadId (NULL = don't need the ID).
 	call	CreateRemoteThread			      ; Returns handle to the new thread in RAX, or NULL on failure.
