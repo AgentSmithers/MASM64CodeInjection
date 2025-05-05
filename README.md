@@ -1,12 +1,14 @@
 🔧 Purpose of the Code
 The program locates a specific target process, injects a custom code payload or a DLL into it, and hooks Windows time-related APIs (like GetTickCount, timeGetTime, and QueryPerformanceCounter) to simulate faster passage of time within that target process. It's essentially a cheat-like mechanism often used for debugging, reverse engineering, or game manipulation.
 
-Features
+```
+### Features
 ✅ Fully contained Non-Dll memory injection method
 ✅ Windows 11 Compatible
 ✅ Bypasses DEP and ASLR using PEB based recursive search
 ✅ Supports DLL based injection via (string)FilePath
 ✅ Tested and validated
+```
 
 🧩 Main Functional Components
 1. Privilege Elevation
